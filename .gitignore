@@ -1,0 +1,7 @@
+hauigaki.db
+bot_token.txt
+exp_setting.json
+chkproxy_strikes.json
+__pycache__/
+venv/
+*.bak-*
