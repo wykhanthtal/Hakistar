@@ -34,7 +34,8 @@ from telebot import types
 from telebot.async_telebot import AsyncTeleBot
 
 # ========== CONFIG ==========
-# VPS-only copy: the bot token is embedded below. Keep this file private.
+# Token sources, in order: BOT_TOKEN env var (e.g. Railway variables),
+# bot_token.txt, then the embedded literal below (blank in this repo copy).
 HYBRID_BOT_TOKEN = ''
 TOKEN_FILE = os.environ.get("BOT_TOKEN_FILE", "bot_token.txt")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -917,6 +918,25 @@ async def validate_session_url(url):
         return False
     probe_url = f"https://{host}/"
     pm = get_proxy_manager()
+    if not USE_PROXY:
+        try:
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(probe_url,
+                                       headers={"user-agent": random.choice(USER_AGENTS)},
+                                       allow_redirects=True) as resp:
+                    if resp.status >= 500:
+                        return False
+                    try:
+                        body = await resp.text()
+                    except Exception:
+                        body = ""
+                    low = body.lower()
+                    if "request limited" in low or "too many requests" in low:
+                        return False
+                    return True
+        except Exception:
+            return False
     for _ in range(5):
         proxy = await pm.get_next()
         if not proxy:
@@ -956,6 +976,13 @@ async def can_open_portal_session(session_url):
     proxies sequentially. Returns True if any proxy yields a sessionId.
     Read-only — never marks proxies bad."""
     pm = get_proxy_manager()
+    if not USE_PROXY:
+        try:
+            timeout = aiohttp.ClientTimeout(total=TIMEOUT_SEC)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                return bool(await get_sid_from_gateway(session, session_url))
+        except Exception:
+            return False
     for _ in range(3):
         proxy = await pm.get_next()
         if not proxy:
@@ -1245,6 +1272,28 @@ def _save_show_expired(value):
 
 SHOW_EXPIRED = _load_show_expired()  # Admin toggle via /exp on|off — persisted in exp_setting.json
 
+PROXY_SETTING_FILE = "proxy_setting.json"
+
+
+def _load_use_proxy():
+    """Persisted /proxy on|off; default ON (scan via proxies). OFF = direct."""
+    try:
+        with open(PROXY_SETTING_FILE) as f:
+            return bool(json.load(f).get("use_proxy", True))
+    except Exception:
+        return True
+
+
+def _save_use_proxy(value):
+    try:
+        with open(PROXY_SETTING_FILE, "w") as f:
+            json.dump({"use_proxy": bool(value)}, f)
+    except OSError:
+        pass
+
+
+USE_PROXY = _load_use_proxy()  # Admin toggle via /proxy on|off — persisted in proxy_setting.json
+
 
 def scan_key(chat_id, scan_id):
     return (int(chat_id), str(scan_id))
@@ -1279,11 +1328,14 @@ async def hybrid_worker(wid, chat_id, scan_id, session_url, code_iter, iter_lock
         task_state = scan_tasks.get(chat_id)
         if not task_state or task_state.get("scan_id") != scan_id or task_state.get("stop"):
             return
-        proxy = await pm.get_next()
-        if not proxy:
-            # No proxies left — never fall back to direct IP; wait for reload/stop.
-            await asyncio.sleep(2)
-            continue
+        if USE_PROXY:
+            proxy = await pm.get_next()
+            if not proxy:
+                # No proxies left — never fall back to direct IP; wait for reload/stop.
+                await asyncio.sleep(2)
+                continue
+        else:
+            proxy = None  # /proxy off — direct connection from this host
         connector = create_connector_for_proxy(proxy)
         timeout = aiohttp.ClientTimeout(total=TIMEOUT_SEC)
         try:
@@ -1503,12 +1555,12 @@ async def run_hybrid_scan(mode, chat_id, session_url, scan_id, progress_msg):
             if not data or data.get("stop") or data.get("exhausted") or data.get("hit_cap") or not workers:
                 break
             pm = get_proxy_manager()
-            if not pm.has_proxies():
+            if USE_PROXY and not pm.has_proxies():
                 # Proxies file is truly empty — stop instead of falling back to direct IP.
                 data["stop"] = True
                 data["proxies_dead"] = True
                 break
-            if pm.get_active_count() == 0:
+            if USE_PROXY and pm.get_active_count() == 0:
                 # All proxies are cooling down — pause, don't stop; they rejoin
                 # rotation automatically after the cooldown.
                 data["paused_for_proxies"] = True
@@ -1557,7 +1609,7 @@ async def run_hybrid_scan(mode, chat_id, session_url, scan_id, progress_msg):
 
 
 async def begin_scan(mode, chat_id, source_message, username=None):
-    if not get_proxy_manager().has_proxies():
+    if USE_PROXY and not get_proxy_manager().has_proxies():
         await bot.send_message(chat_id, premium_emoji(
             "⚠️ <b>No proxies available — scan blocked.</b>\n\n"
             "Reply to a message containing a proxy list with <code>/proxy</code>\n"
@@ -2115,8 +2167,8 @@ async def recheck(message):
     await bot.reply_to(message, premium_emoji(f"🔄 Rechecking {len(results)} codes..."), parse_mode="HTML")
     session_url = user_data[chat_id]["session_url"]
     pm = get_proxy_manager()
-    proxy = await pm.get_next()
-    if not proxy:
+    proxy = await pm.get_next() if USE_PROXY else None
+    if USE_PROXY and not proxy:
         await bot.reply_to(message, premium_emoji(
             "⚠️ <b>No proxies available.</b> Add proxies with <code>/proxy</code> first — direct IP is never used."),
             parse_mode="HTML")
@@ -2183,8 +2235,8 @@ async def check_code_manual(message):
         return
 
     pm = get_proxy_manager()
-    proxy = await pm.get_next()
-    if not proxy:
+    proxy = await pm.get_next() if USE_PROXY else None
+    if USE_PROXY and not proxy:
         await bot.reply_to(message, premium_emoji(
             "⚠️ <b>No proxies available.</b> Add proxies with <code>/proxy</code> first — direct IP is never used."),
             parse_mode="HTML")
@@ -2274,11 +2326,22 @@ async def broadcast(message):
 
 @bot.message_handler(commands=['proxy'])
 async def proxy_command(message):
+    global USE_PROXY
     if not is_admin(message.chat.id):
         await bot.reply_to(message, premium_emoji("❌ Admin access only."), parse_mode="HTML")
         return
     args = message.text.split()
     pm = get_proxy_manager()
+
+    # /proxy on|off — persisted proxy mode (off = scans connect directly)
+    if len(args) > 1 and args[1].lower() in ("on", "off"):
+        USE_PROXY = args[1].lower() == "on"
+        _save_use_proxy(USE_PROXY)
+        state = "🟢 <b>ON</b> — scans go through proxies" if USE_PROXY else "🔴 <b>OFF</b> — scans connect DIRECTLY from this host's IP"
+        await bot.reply_to(message, premium_emoji(
+            f"🌐 <b>Proxy mode: {state}</b>\n{DIVIDER}\nApplies to new scans. Saved — survives restarts."),
+            parse_mode="HTML")
+        return
 
     # /proxy reload
     if len(args) > 1 and args[1].lower() == "reload":
@@ -2295,13 +2358,15 @@ async def proxy_command(message):
     rot_line = f"\n🔄 Rotation: batch {bnum}/{bn} ({bsize} active, every 3 min)" if bn else ""
     await bot.reply_to(message, premium_emoji(
         f"🌐 <b>Proxy status</b>\n{DIVIDER}\n"
+        f"Mode: {'🟢 ON (via proxies)' if USE_PROXY else '🔴 OFF (direct connection)'}\n"
         f"Source: <code>proxies.txt</code>\n"
         f"✅ Active: {total - bad}\n❄️ Cooling: {bad}\n📊 Total: {total}{rot_line}\n\n"
         "📥 Add: <code>/addproxy</code>\n"
         "🔍 Check & clean: <code>/chkproxy</code>\n"
         "🗑️ Remove: <code>/rmproxy</code>\n"
         "<code>/proxy reload</code> — reload proxies.txt\n"
-        "⚠️ Empty = scan blocked (no direct IP)."),
+        "⚠️ Empty = scan blocked (no direct IP).\n"
+        "🔀 Switch: <code>/proxy on</code> / <code>/proxy off</code>"),
         parse_mode="HTML")
 
 
@@ -2914,7 +2979,7 @@ async def main():
     main_task = asyncio.current_task()
     loop.add_signal_handler(signal.SIGTERM, main_task.cancel)
     get_proxy_manager()
-    install_tg_flood_protection()
+    # tg-flood wrapper REMOVED 2026-10-12: Minmay-style direct calls, fail-and-drop
     web_task = asyncio.create_task(web_server())
     checker_task = asyncio.create_task(proxy_health_checker())
     try:
